@@ -19,42 +19,6 @@ Sistem ini dibangun dengan pendekatan **Enterprise Generative AI & Agentic Syste
 
 ## 2. Panduan Menjalankan Sistem
 
-### A. Menjalankan via Docker Compose (Standar Pengiriman / Evaluasi Resmi)
-
-Pengujian dan penilaian akhir dilakukan di lingkungan Docker murni tanpa instalasi Python pada host grader.
-
-1. **Persiapkan Environment**:
-   Salin file konfigurasi environment dan sesuaikan kredensial model OpenAI:
-   ```powershell
-   Copy-Item .env.example .env
-   # Di Linux/macOS: cp .env.example .env
-   ```
-   *Pastikan nilai `OPENAI_API_KEY`, `AGENT_MODEL`, dan `EMBEDDING_MODEL` sudah terisi.*
-
-2. **Build dan Jalankan Service Penunjang**:
-   ```powershell
-   docker compose -p p2m2_demo build api streamlit
-   docker compose -p p2m2_demo up -d postgres redis
-   ```
-
-3. **Inisialisasi Database & Seeding Kebijakan (Setup Lab)**:
-   ```powershell
-   docker compose -p p2m2_demo run --rm api python -m src.setup_lab
-   ```
-
-4. **Jalankan API dan Frontend Streamlit**:
-   ```powershell
-   docker compose -p p2m2_demo up -d api streamlit
-   ```
-
-5. **Akses Layanan**:
-   - **Streamlit UI**: [http://localhost:8501](http://localhost:8501)
-   - **FastAPI Docs (Swagger)**: [http://localhost:8000/docs](http://localhost:8000/docs)
-   - **Healthcheck**: [http://localhost:8000/healthz](http://localhost:8000/healthz)
-   - **Readiness Check**: [http://localhost:8000/readyz](http://localhost:8000/readyz)
-
----
-
 ### B. Menjalankan untuk Pengembangan Lokal (Local Development)
 
 Jika ingin mengembangkan atau men-debug kode secara langsung pada host Python lokal:
@@ -365,17 +329,3 @@ Setiap respons dari `POST /api/v1/chat` memuat status `outcome` yang terikat kon
 
 ---
 
-## 8. Referensi Dokumentasi Teknis
-
-Dokumentasi detail mengenai keputusan teknis, arsitektur, dan mitigasi risiko tersimpan di direktori `docs/`:
-
-
-- [003-PENJELASAN_TECH_STACK_HR_AGENT_AWAM.md](docs/003-PENJELASAN_TECH_STACK_HR_AGENT_AWAM.md) — Panduan konseptual stack teknologi.
-- [006-rancangan_table.md](docs/006-rancangan_table.md) — Desain skema basis data PostgreSQL.
-- [008-checkpoint-penjelasan-fungsi-file.md](docs/008-checkpoint-penjelasan-fungsi-file.md) — Penjelasan detail fungsi setiap file backend.
-- [015-GUARDRAIL-PROJECT-HR-AGENT.md](docs/015-GUARDRAIL-PROJECT-HR-AGENT.md) — Implementasi guardrail keamanan dan anti-injeksi.
-- [017-PENJELASAN_PERAN_DAN_IMPLEMENTASI_REDIS.md](docs/017-PENJELASAN_PERAN_DAN_IMPLEMENTASI_REDIS.md) — Arsitektur caching dan degradasi Redis.
-- [020-upaya-fix-NO-GO-CRITERIA.md](docs/020-upaya-fix-NO-GO-CRITERIA.md) & [021-coba-fix-outcome-miss.md](docs/021-coba-fix-outcome-miss.md) — Analisis akar masalah perbaikan kriteria evaluasi menuju status GO.
-- [docker-delivery.md](docker-delivery.md) — Kontrak standar pengujian dan grading Docker.
-
----
