@@ -17,169 +17,7 @@ Sistem ini dibangun dengan pendekatan **Enterprise Generative AI & Agentic Syste
 
 ---
 
-## 2. Arsitektur Sistem & Alur Kerja
-
-Sistem mengadopsi arsitektur *layered service* yang memisahkan presentasi, orkestrasi agent, layer domain bisnis, integrasi AI provider, dan persistence layer.
-
-```text
-               +-------------------------------------------+
-               |        Frontend (Streamlit / app.py)      |
-               +-------------------------------------------+
-                                     |  HTTP (Bearer Token)
-                                     v
-               +-------------------------------------------+
-               |         FastAPI REST API (src/api.py)     |
-               +-------------------------------------------+
-                                     |
-               +-------------------------------------------+
-               |       Orchestrator (src/agent.py)         |
-               |  - Multi-Turn Loop   - Post-Processing    |
-               |  - System Guardrails - Citation Validator |
-               |  - Outcome Resolver  - PII Sanitization   |
-               +-------------------------------------------+
-                   /             |              \
-                  v              v               v
-       +-----------------+ +------------+ +--------------------+
-       | Provider Layer  | | Tool Layer | | Security & Redact  |
-       | (OpenAI / Mock) | | (4 Tools)  | | (Token, PII Mask)  |
-       +-----------------+ +------------+ +--------------------+
-                                 |
-            +--------------------+--------------------+
-            |                    |                    |
-            v                    v                    v
-     +--------------+     +--------------+     +---------------+
-     |  retrieval   |     |    domain    |     |  repository   |
-     | (Hybrid RAG) |     | (Leave Rule) |     |  (DB / State) |
-     +--------------+     +--------------+     +---------------+
-            |                    |                    |
-            +---------+          |          +---------+
-                      |          |          |
-                      v          v          v
-              +-----------------------------------+
-              |      PostgreSQL / pgvector        |
-              |   (Vector Embeddings & RDBMS)     |
-              +-----------------------------------+
-                                ^
-                                | (Cache / Fallback)
-              +-----------------------------------+
-              |        Redis 7 (Alpine)           |
-              +-----------------------------------+
-```
-
-### Komponen Utama
-
-| Komponen | File Utama | Deskripsi Peran |
-|---|---|---|
-| **API Layer** | `src/api.py` | FastAPI server yang mengelola endpoint `/healthz`, `/readyz`, `/api/v1/chat`, proposal confirmation, dan monitoring. |
-| **Agent Orchestrator** | `src/agent.py` | Mengelola *reasoning loop*, pemanggilan tools, validasi sitasi, klasifikasi outcome, serta pembatasan turn & token. |
-| **Tool Execution** | `src/tools.py` | Mendefinisikan 4 tools: `search_hr_policy`, `get_my_leave_balance`, `prepare_leave_request`, dan `create_hr_ticket`. |
-| **Domain Logic** | `src/domain.py` | Aturan bisnis cuti: kalkulasi hari kerja (*exclude weekend*), validasi tanggal masa lalu, overlap pengajuan, dan batas saldo. |
-| **Hybrid Retrieval** | `src/retrieval.py` | Pencarian kebijakan kombinasi vektor embedding (`pgvector`) dan lexical matching untuk presisi tinggi. |
-| **Security & Privacy** | `src/security.py` | Hashing bearer token (SHA-256), redaksi pola sensitif (PII/medis/API key), serta deteksi prompt injection. |
-| **Storage & Repo** | `src/repository.py` | Abstraksi PostgreSQL untuk penyimpanan data pegawai, saldo, histori permohonan, proposal, tiket, dan audit trace. |
-| **Cache Layer** | `src/cache.py` | *Resilient cache* Redis untuk mempercepat retrieval query kebijakan dengan mekanisme fallback aman (*fail-open*). |
-| **Evaluasi Benchmark** | `src/run_evaluation.py` | Runner otomatis untuk 15 skenario benchmark evaluasi kualitas jawaban, kepatuhan batas keamanan, dan hard gate. |
-
----
-
-## 3. Batasan Sistem & Kebijakan Keamanan (Security Boundaries)
-
-1. **Zero-Trust & Identity Isolation**:
-   - `employee_id` didapatkan secara deterministik dari database berdasarkan hash Bearer Token yang lolos autentikasi.
-   - Tidak ada parameter `employee_id` pada payload percakapan pengguna maupun argumen tool model. Upaya pengguna meminta data atau saldo karyawan lain (`EMP-002`, dsb.) akan ditolak secara mutlak.
-2. **Human-in-the-Loop & Status Cuti**:
-   - Tidak ada tool atau endpoint yang dapat memberikan status `approved`.
-   - Tool `prepare_leave_request` hanya menghasilkan proposal dengan masa berlaku (*expiry time*).
-   - Pengajuan cuti resmi baru dibuat saat pengguna mengirimkan konfirmasi via endpoint `/api/v1/action-proposals/{id}/confirm` dengan *idempotency key*, dan statusnya selalu `pending_manager_review`.
-3. **Grounded Retrieval & Sitasi Wajib**:
-   - Jawaban atas pertanyaan kebijakan wajib menyertakan sitasi formal dalam format `[DOCUMENT-ID]` (misal: `[HR-LEAVE-001]`).
-   - Agent memvalidasi apakah sitasi tersebut benar-benar ada dalam daftar potongan dokumen yang terambil (*retrieved chunks*) pada sesi tersebut. Jika sitasi palsu/halusinasi terdeteksi, jawaban otomatis diubah menjadi `abstained`.
-4. **Perlindungan Data Medis & PII**:
-   - Riwayat medis dan diagnosis sensitif (misal: diabetes, rekam medis) otomatis diredaksi sebelum jawaban dikirim ke pengguna.
-5. **Trace & Monitoring RBAC**:
-   - Trace percakapan disamarkan dan hanya dapat diakses oleh pemiliknya sendiri.
-   - Endpoint monitoring (`/api/v1/monitoring/*`) hanya dapat diakses oleh pengguna dengan role `admin`.
-
----
-
-## 4. Empat Outcome Status Percakapan
-
-Setiap respons dari `POST /api/v1/chat` memuat status `outcome` yang terikat kontrak Pydantic:
-
-| Status Outcome | Makna Teknis | Contoh Kasus Penggunaan |
-|---|---|---|
-| `answered` | Pertanyaan berhasil dijawab secara faktual dengan bukti sitasi dokumen yang valid. | Menjelaskan hak cuti tahunan (12 hari kerja) berdasarkan dokumen `[HR-LEAVE-001]`. |
-| `action_proposed` | Permintaan aksi cuti valid; proposal berhasil dibuat dan menunggu konfirmasi pengguna. | Mengajukan cuti 3 hari di masa depan dengan saldo mencukupi (`requires_confirmation: true`). |
-| `abstained` | Sistem menolak menjawab atau memproses aksi karena pelanggaran aturan, tanggal tidak valid, atau bukti tidak cukup. | Pengajuan cuti di masa lalu, saldo tidak cukup, dokumen kebijakan tidak ditemukan, atau sitasi palsu. |
-| `escalated` | Pertanyaan/masalah tidak dapat diselesaikan secara otomatis dan diteruskan ke tim HR via tiket bantuan. | Terdapat pertentangan/konflik antar kebijakan yang memerlukan klarifikasi tim HR manusia. |
-
----
-
-## 5. Kontrak Endpoint API
-
-| Method | Path | Autentikasi | Deskripsi & Hasil |
-|---|---|---|---|
-| `GET` | `/healthz` | Publik | Liveness check; memastikan container/proses API aktif. |
-| `GET` | `/readyz` | Publik | Readiness check; memverifikasi koneksi PostgreSQL, Redis, dan kesiapan index. |
-| `POST` | `/api/v1/chat` | Bearer Token | Endpoint utama chat; mengembalikan `ChatResponse` (jawaban, sitasi, outcome, proposal, trace, token usage). |
-| `POST` | `/api/v1/action-proposals/{proposal_id}/confirm` | Bearer Token | Konfirmasi proposal cuti menjadi permohonan `pending_manager_review` dengan idempotency key. |
-| `GET` | `/api/v1/leave-requests/me` | Bearer Token | Mengambil daftar riwayat dan status permohonan cuti milik pegawai yang sedang login. |
-| `GET` | `/api/v1/traces/{trace_id}` | Bearer Token | Mengambil detail audit trace tersamarkan (hanya milik sendiri atau admin). |
-| `GET` | `/api/v1/monitoring/summary` | Bearer Token (Admin) | Statistik penggunaan token, total chat, distribusi outcome, dan error rate. |
-| `GET` | `/api/v1/monitoring/alerts` | Bearer Token (Admin) | Mendeteksi kondisi darurat/anomali sistem (misal: error rate > 10%). |
-
----
-
-## 6. Struktur Direktori Proyek
-
-```text
-AlwaysON-HR/
-├── app.py                      # Frontend Streamlit (Client interface)
-├── ui_contract.py              # Adapter komunikasi Streamlit ke FastAPI
-├── demo_personas.json          # Fixture persona demo (Alya, Bima, Citra, Dedi Admin)
-├── Dockerfile                  # Multi-service non-root container image
-├── docker-compose.yml          # Orkestrasi 4 service: PostgreSQL, Redis, API, Streamlit
-├── docker-delivery.md          # Kontrak & panduan evaluasi Docker resmi
-├── brief.md                    # Dokumen spesifikasi teknis dan kebutuhan proyek
-├── lab.md                      # Panduan praktikum, checkpoint, dan arsitektur
-├── requirements.txt            # Dependensi Python
-├── data/
-│   ├── policies/               # Dokumen Markdown kebijakan HR (HR-LEAVE, HR-WORK, dll.)
-│   ├── employees.json          # Data pegawai sintetis & saldo cuti awal
-│   ├── historical_requests.json# Data riwayat cuti masa lalu
-│   ├── evaluation_cases.json   # 15 skenario benchmark pengujian
-│   └── monitoring_rules.json   # Aturan ambang batas monitoring & alert
-├── src/
-│   ├── __init__.py
-│   ├── agent.py                # Agent reasoning loop, guardrail & outcome post-processor
-│   ├── api.py                  # FastAPI route handlers & dependency injection runtime
-│   ├── cache.py                # Redis resilient caching layer
-│   ├── config.py               # Settings konfigurasi environment (Pydantic Settings)
-│   ├── contracts.py            # Pydantic schemas untuk API, Tools, Trace, dan Outcome
-│   ├── domain.py               # Aturan kalkulasi & validasi bisnis cuti
-│   ├── providers.py            # Integrasi model OpenAI & Deterministic Mock Provider
-│   ├── repository.py           # Layer repositori PostgreSQL & In-Memory fallback
-│   ├── retrieval.py            # Hybrid retrieval (vector + lexical search)
-│   ├── run_evaluation.py       # Benchmark test runner (15 cases, hard/soft gates)
-│   ├── security.py             # Redaksi PII, token hashing, & deteksi prompt injection
-│   ├── setup_lab.py            # Inisialisasi DB, migrasi skema & seeding chunk kebijakan
-│   └── tools.py                # Implementasi 4 tool LLM dengan isolasi identitas
-├── tests/
-│   ├── conftest.py             # Pytest fixtures & setup environment
-│   ├── test_actions.py         # Test alur proposal, konfirmasi idempotent, & expiry
-│   ├── test_agent_reliability.py# Test fallback provider, fake citation, & stabilitas chunk
-│   ├── test_api.py             # Test endpoint API, autentikasi, & RBAC trace/monitoring
-│   ├── test_chat_session.py    # Test kontinuitas sesi obrolan & riwayat percakapan
-│   ├── test_domain.py          # Test business logic cuti, hari kerja, & overlap
-│   ├── test_live_api.py        # Test live integrasi ke service API
-│   ├── test_retrieval_security.py # Test hybrid search, redaksi data, & tool args security
-│   └── test_supplied_ui.py     # Test kepatuhan UI Streamlit terhadap kontrak API
-└── docs/                       # Dokumentasi analisis teknis & catatan pengembangan
-```
-
----
-
-## 7. Panduan Menjalankan Sistem
+## 2. Panduan Menjalankan Sistem
 
 ### A. Menjalankan via Docker Compose (Standar Pengiriman / Evaluasi Resmi)
 
@@ -256,35 +94,278 @@ Jika ingin mengembangkan atau men-debug kode secara langsung pada host Python lo
 
 ---
 
-## 8. Pengujian & Evaluasi Kualitas (Testing & Quality Gates)
+## 3. Hal yang perlu diperhatikan ketika clone
 
-### 1. Deterministic Test Suite (Offline / Non-Live Tests)
-Suite ini menguji seluruh logika unit, integrasi API, domain logic, isolasi identitas, dan reliabilitas tool tanpa membutuhkan koneksi LLM live:
-```powershell
-# Via Docker:
-docker compose -p p2m2_demo run --rm api python -m pytest -m "not live" -v
+Troubleshooting setelah clone GitHub menunjukkan bahwa beberapa kondisi dapat tampak sehat meskipun aliran aplikasi belum siap sepenuhnya. Gunakan urutan pemeriksaan berikut:
 
-# Via Local venv:
-python -m pytest -m "not live" -v
-```
-*Hasil: Seluruh 28 skenario pengujian lulus (`28 passed`).*
+### 3.1. Konfigurasi environment harus lengkap
 
-### 2. Live Benchmark Evaluation (15 Skenario Uji)
-Evaluator otomatis menguji respons sistem terhadap 15 skenario nyata dari `data/evaluation_cases.json`, mencakup akurasi sitasi kebijakan, penolakan pengajuan masa lalu, isolasi identitas antar karyawan, kekebalan prompt injection, serta penyaringan PII medis.
+Jangan menganggap `.env.example` langsung cukup untuk mode live. Masalah autentikasi atau retrieval dapat berasal dari variabel yang kosong. Nilai minimum yang perlu diperiksa adalah:
 
-```powershell
-# Menjalankan evaluator:
-docker compose -p p2m2_demo exec -T api python -m src.run_evaluation http://localhost:8000 token-alya
+```env
+MODEL_MODE=live
+OPENAI_API_KEY=<key-yang-valid>
+OPENAI_BASE_URL=<base-url-provider>
+AGENT_MODEL=<nama-model-chat>
+EMBEDDING_MODEL=<nama-model-embedding>
+EMBEDDING_DIMENSIONS=1536
+DATABASE_URL=postgresql://hr_app:hr_app@postgres:5432/hr_assistant
+REDIS_URL=redis://redis:6379/0
 ```
 
-#### Kriteria Keputusan Rilis (Release Gate):
-- **Hard Gate Failures**: Wajib **0** (tidak boleh ada kebocoran PII, pelanggaran data antar-pegawai, persetujuan sepihak, atau outcome salah pada kasus kritis).
-- **Pass Rate**: Minimal **80%** (>= 12 dari 15 kasus lulus).
-- **Status Rilis**: **`GO`** hanya jika kedua syarat di atas terpenuhi secara deterministik.
+Dalam Docker Compose, nama host `postgres`, `redis`, dan `api` adalah alamat antar-container. Gunakan `localhost` hanya untuk koneksi dari host, bukan dari service API.
+
+Periksa konfigurasi yang terbaca container:
+
+```powershell
+docker compose exec api env | findstr /I "MODEL_MODE DATABASE_URL AGENT_MODEL EMBEDDING_MODEL EMBEDDING_DIMENSIONS OPENAI_BASE_URL"
+
+docker compose exec api python -c "from src.config import get_settings; s=get_settings(); print({'model_mode': s.model_mode, 'live_model_ready': s.live_model_ready, 'embedding_model': s.embedding_model, 'embedding_dimensions': s.embedding_dimensions})"
+```
+
+`live_model_ready` harus bernilai `True` agar seeding membuat embedding kebijakan.
+
+### 3.2. `/healthz` dan `/readyz` memiliki arti berbeda
+
+- `/healthz` hanya memastikan proses API masih hidup.
+- `/readyz` pada implementasi saat ini memeriksa database melalui `repository.health()`.
+- Keduanya tidak otomatis membuktikan bahwa data pegawai, chunk kebijakan, atau embedding sudah tersedia.
+
+Verifikasi harus dilakukan terpisah untuk tabel data, data identity, dan index kebijakan.
+
+### 3.3. Seeding database adalah langkah wajib setelah clone
+
+Menjalankan PostgreSQL atau melihat container `healthy` tidak membuat tabel dan data sintetis. Setelah PostgreSQL aktif, jalankan:
+
+```powershell
+docker compose run --rm api python -m src.setup_lab
+docker compose restart api
+```
+
+Untuk reset penuh dari volume baru atau database lama yang tidak lagi valid:
+
+```powershell
+docker compose down -v
+docker compose up -d postgres redis
+docker compose run --rm api python -m src.setup_lab
+docker compose up -d api streamlit
+```
+
+Hati-hati: `docker compose down -v` menghapus seluruh volume PostgreSQL lokal.
+
+### 3.4. Autentikasi Swagger memakai token mentah
+
+Pada Swagger, klik **Authorize** dan masukkan:
+
+```text
+token-alya
+```
+
+Jangan memasukkan `Bearer token-alya` pada kolom Swagger, karena Swagger menambahkan prefix `Bearer` secara otomatis.
+
+Untuk pengujian API langsung:
+
+```http
+Authorization: Bearer token-alya
+```
+
+Token demo di [demo_personas.json](demo_personas.json) dipetakan ke `employee_id`:
+
+- `token-alya` -> `EMP-001`
+- `token-bima` -> `EMP-002`
+- `token-admin` -> `ADM-001`
+
+Sistem menyimpan SHA-256 token, bukan token mentah. Jika Swagger menghasilkan `401 Invalid token`, periksa tabel berikut:
+
+```powershell
+docker compose exec postgres psql -U hr_app -d hr_assistant -c `
+  "SELECT employee_id, display_name, role, token_hash FROM employee;"
+```
+
+### 3.5. Chunk kebijakan dan embedding harus diverifikasi terpisah
+
+Seeding 15 section harus menghasilkan 15 baris pada tabel `policy_chunk`.
+
+```powershell
+docker compose exec postgres psql -U hr_app -d hr_assistant -c `
+  "SELECT count(*) AS policy_chunk_count FROM policy_chunk;"
+
+docker compose exec postgres psql -U hr_app -d hr_assistant -c `
+  "SELECT count(*) AS chunk_count,
+          count(embedding) AS embedded_chunk_count
+   FROM policy_chunk;"
+```
+
+Untuk seeding lengkap:
+
+```text
+policy_chunk_count  = 15
+embedded_chunk_count = 15
+```
+
+Tinjau daftar chunk bila perlu:
+
+```powershell
+docker compose exec postgres psql -U hr_app -d hr_assistant -c `
+  "SELECT chunk_id, document_id, section, version
+   FROM policy_chunk
+   ORDER BY document_id, section;"
+```
+
+Jika jumlah chunk `15` tetapi jumlah embedding `0`, penyebab umumnya `EMBEDDING_MODEL` kosong atau konfigurasi tidak terbaca saat seeding. Perbaiki `.env`, recreate container API, lalu jalankan seeding lagi.
+
+### 3.6. Retrieval dapat mempunyai dua jalur pencarian
+
+[src/retrieval.py](src/retrieval.py) menggabungkan:
+
+- pencarian leksikal PostgreSQL/TSVector;
+- pencarian vektor pgvector jika embedding tersedia;
+- Reciprocal Rank Fusion;
+- keyword reranking.
+
+Periksa pencarian leksikal secara langsung:
+
+```powershell
+docker compose exec postgres psql -U hr_app -d hr_assistant -c `
+  "SELECT chunk_id, document_id, section,
+          ts_rank(search_tsv, to_tsquery('simple', 'cuti | tahunan')) AS rank
+   FROM policy_chunk
+   WHERE search_tsv @@ to_tsquery('simple', 'cuti | tahunan')
+   ORDER BY rank DESC
+   LIMIT 5;"
+```
+
+Jika hasil pencarian kosong, perlu diperiksa kembali chunk atau bentuk query. Jika jumlah embedding `0`, cache atau service tidak boleh dianggap gagal; jalankan seeding ulang dengan model embedding aktif.
+
+### 3.7. Urutan troubleshooting yang disarankan
+
+1. Periksa environment yang terbaca oleh API.
+2. Periksa `/healthz` dan `/readyz`.
+3. Pastikan tabel `employee` berisi tiga persona demo.
+4. Pastikan tabel `policy_chunk` berisi 15 chunk.
+5. Pastikan jumlah `embedding IS NOT NULL` sama dengan jumlah chunk.
+6. Uji pencarian leksikal secara langsung pada PostgreSQL.
+7. Bersihkan cache Redis bila hasil pencarian lama tersimpan.
+8. Uji endpoint `/api/v1/chat` melalui Swagger dengan token yang benar.
+
+Urutan ini memisahkan kegagalan infrastruktur, database, konfigurasi LLM, seeding, retrieval, dan autentikasi sehingga akar masalah dapat ditentukan tanpa menebak.
 
 ---
 
-## 9. Referensi Dokumentasi Teknis
+## 4. Arsitektur Sistem & Alur Kerja
+
+Sistem mengadopsi arsitektur *layered service* yang memisahkan presentasi, orkestrasi agent, layer domain bisnis, integrasi AI provider, dan persistence layer.
+
+```text
+               +-------------------------------------------+
+               |        Frontend (Streamlit / app.py)      |
+               +-------------------------------------------+
+                                     |  HTTP (Bearer Token)
+                                     v
+               +-------------------------------------------+
+               |         FastAPI REST API (src/api.py)     |
+               +-------------------------------------------+
+                                     |
+               +-------------------------------------------+
+               |       Orchestrator (src/agent.py)         |
+               |  - Multi-Turn Loop   - Post-Processing    |
+               |  - System Guardrails - Citation Validator |
+               |  - Outcome Resolver  - PII Sanitization   |
+               +-------------------------------------------+
+                   /             |              \
+                  v              v               v
+       +-----------------+ +------------+ +--------------------+
+       | Provider Layer  | | Tool Layer | | Security & Redact  |
+       | (OpenAI / Mock) | | (4 Tools)  | | (Token, PII Mask)  |
+       +-----------------+ +------------+ +--------------------+
+                                 |
+            +--------------------+--------------------+
+            |                    |                    |
+            v                    v                    v
+     +--------------+     +--------------+     +---------------+
+     |  retrieval   |     |    domain    |     |  repository   |
+     | (Hybrid RAG) |     | (Leave Rule) |     |  (DB / State) |
+     +--------------+     +--------------+     +---------------+
+            |                    |                    |
+            +---------+          |          +---------+
+                      |          |          |
+                      v          v          v
+              +-----------------------------------+
+              |      PostgreSQL / pgvector        |
+              |   (Vector Embeddings & RDBMS)     |
+              +-----------------------------------+
+                                ^
+                                | (Cache / Fallback)
+              +-----------------------------------+
+              |        Redis 7 (Alpine)           |
+              +-----------------------------------+
+```
+
+### Komponen Utama
+
+| Komponen | File Utama | Deskripsi Peran |
+|---|---|---|
+| **API Layer** | `src/api.py` | FastAPI server yang mengelola endpoint `/healthz`, `/readyz`, `/api/v1/chat`, proposal confirmation, dan monitoring. |
+| **Agent Orchestrator** | `src/agent.py` | Mengelola *reasoning loop*, pemanggilan tools, validasi sitasi, klasifikasi outcome, serta pembatasan turn & token. |
+| **Tool Execution** | `src/tools.py` | Mendefinisikan 4 tools: `search_hr_policy`, `get_my_leave_balance`, `prepare_leave_request`, dan `create_hr_ticket`. |
+| **Domain Logic** | `src/domain.py` | Aturan bisnis cuti: kalkulasi hari kerja (*exclude weekend*), validasi tanggal masa lalu, overlap pengajuan, dan batas saldo. |
+| **Hybrid Retrieval** | `src/retrieval.py` | Pencarian kebijakan kombinasi vektor embedding (`pgvector`) dan lexical matching untuk presisi tinggi. |
+| **Security & Privacy** | `src/security.py` | Hashing bearer token (SHA-256), redaksi pola sensitif (PII/medis/API key), serta deteksi prompt injection. |
+| **Storage & Repo** | `src/repository.py` | Abstraksi PostgreSQL untuk penyimpanan data pegawai, saldo, histori permohonan, proposal, tiket, dan audit trace. |
+| **Cache Layer** | `src/cache.py` | *Resilient cache* Redis untuk mempercepat retrieval query kebijakan dengan mekanisme fallback aman (*fail-open*). |
+| **Evaluasi Benchmark** | `src/run_evaluation.py` | Runner otomatis untuk 15 skenario benchmark evaluasi kualitas jawaban, kepatuhan batas keamanan, dan hard gate. |
+
+---
+
+## 5. Batasan Sistem & Kebijakan Keamanan (Security Boundaries)
+
+1. **Zero-Trust & Identity Isolation**:
+   - `employee_id` didapatkan secara deterministik dari database berdasarkan hash Bearer Token yang lolos autentikasi.
+   - Tidak ada parameter `employee_id` pada payload percakapan pengguna maupun argumen tool model. Upaya pengguna meminta data atau saldo karyawan lain (`EMP-002`, dsb.) akan ditolak secara mutlak.
+2. **Human-in-the-Loop & Status Cuti**:
+   - Tidak ada tool atau endpoint yang dapat memberikan status `approved`.
+   - Tool `prepare_leave_request` hanya menghasilkan proposal dengan masa berlaku (*expiry time*).
+   - Pengajuan cuti resmi baru dibuat saat pengguna mengirimkan konfirmasi via endpoint `/api/v1/action-proposals/{id}/confirm` dengan *idempotency key*, dan statusnya selalu `pending_manager_review`.
+3. **Grounded Retrieval & Sitasi Wajib**:
+   - Jawaban atas pertanyaan kebijakan wajib menyertakan sitasi formal dalam format `[DOCUMENT-ID]` (misal: `[HR-LEAVE-001]`).
+   - Agent memvalidasi apakah sitasi tersebut benar-benar ada dalam daftar potongan dokumen yang terambil (*retrieved chunks*) pada sesi tersebut. Jika sitasi palsu/halusinasi terdeteksi, jawaban otomatis diubah menjadi `abstained`.
+4. **Perlindungan Data Medis & PII**:
+   - Riwayat medis dan diagnosis sensitif (misal: diabetes, rekam medis) otomatis diredaksi sebelum jawaban dikirim ke pengguna.
+5. **Trace & Monitoring RBAC**:
+   - Trace percakapan disamarkan dan hanya dapat diakses oleh pemiliknya sendiri.
+   - Endpoint monitoring (`/api/v1/monitoring/*`) hanya dapat diakses oleh pengguna dengan role `admin`.
+
+---
+
+## 6. Empat Outcome Status Percakapan
+
+Setiap respons dari `POST /api/v1/chat` memuat status `outcome` yang terikat kontrak Pydantic:
+
+| Status Outcome | Makna Teknis | Contoh Kasus Penggunaan |
+|---|---|---|
+| `answered` | Pertanyaan berhasil dijawab secara faktual dengan bukti sitasi dokumen yang valid. | Menjelaskan hak cuti tahunan (12 hari kerja) berdasarkan dokumen `[HR-LEAVE-001]`. |
+| `action_proposed` | Permintaan aksi cuti valid; proposal berhasil dibuat dan menunggu konfirmasi pengguna. | Mengajukan cuti 3 hari di masa depan dengan saldo mencukupi (`requires_confirmation: true`). |
+| `abstained` | Sistem menolak menjawab atau memproses aksi karena pelanggaran aturan, tanggal tidak valid, atau bukti tidak cukup. | Pengajuan cuti di masa lalu, saldo tidak cukup, dokumen kebijakan tidak ditemukan, atau sitasi palsu. |
+| `escalated` | Pertanyaan/masalah tidak dapat diselesaikan secara otomatis dan diteruskan ke tim HR via tiket bantuan. | Terdapat pertentangan/konflik antar kebijakan yang memerlukan klarifikasi tim HR manusia. |
+
+---
+
+## 7. Kontrak Endpoint API
+
+| Method | Path | Autentikasi | Deskripsi & Hasil |
+|---|---|---|---|
+| `GET` | `/healthz` | Publik | Liveness check; memastikan container/proses API aktif. |
+| `GET` | `/readyz` | Publik | Readiness check; memverifikasi koneksi PostgreSQL, Redis, dan kesiapan index. |
+| `POST` | `/api/v1/chat` | Bearer Token | Endpoint utama chat; mengembalikan `ChatResponse` (jawaban, sitasi, outcome, proposal, trace, token usage). |
+| `POST` | `/api/v1/action-proposals/{proposal_id}/confirm` | Bearer Token | Konfirmasi proposal cuti menjadi permohonan `pending_manager_review` dengan idempotency key. |
+| `GET` | `/api/v1/leave-requests/me` | Bearer Token | Mengambil daftar riwayat dan status permohonan cuti milik pegawai yang sedang login. |
+| `GET` | `/api/v1/traces/{trace_id}` | Bearer Token | Mengambil detail audit trace tersamarkan (hanya milik sendiri atau admin). |
+| `GET` | `/api/v1/monitoring/summary` | Bearer Token (Admin) | Statistik penggunaan token, total chat, distribusi outcome, dan error rate. |
+| `GET` | `/api/v1/monitoring/alerts` | Bearer Token (Admin) | Mendeteksi kondisi darurat/anomali sistem (misal: error rate > 10%). |
+
+---
+
+## 8. Referensi Dokumentasi Teknis
 
 Dokumentasi detail mengenai keputusan teknis, arsitektur, dan mitigasi risiko tersimpan di direktori `docs/`:
 
@@ -297,3 +378,4 @@ Dokumentasi detail mengenai keputusan teknis, arsitektur, dan mitigasi risiko te
 - [020-upaya-fix-NO-GO-CRITERIA.md](docs/020-upaya-fix-NO-GO-CRITERIA.md) & [021-coba-fix-outcome-miss.md](docs/021-coba-fix-outcome-miss.md) — Analisis akar masalah perbaikan kriteria evaluasi menuju status GO.
 - [docker-delivery.md](docker-delivery.md) — Kontrak standar pengujian dan grading Docker.
 
+---
