@@ -22,7 +22,7 @@ def _encode_image(path: Path) -> tuple[str, str]:
     return base64.b64encode(path.read_bytes()).decode(), mime
 
 
-def _inject_custom_theme() -> None:
+def _inject_custom_theme(compact_layout: bool = False) -> None:
     bg_path = _ASSETS / "xts_bg.jpeg"
 
     bg_css = ""
@@ -261,6 +261,32 @@ def _inject_custom_theme() -> None:
         }
     """
 
+    if compact_layout:
+        static_css += r"""
+        /* Bring the brand and tabs close to the top only after chat starts,
+           without expanding the height of the main page. */
+        [data-testid="stMainBlockContainer"],
+        .main .block-container,
+        [data-testid="stAppViewBlockContainer"] {
+            padding-top: 0.75rem !important;
+            padding-bottom: 0.5rem !important;
+        }
+        [data-testid="stHeading"] {
+            margin-top: -0.75rem !important;
+            margin-bottom: 0.1rem !important;
+        }
+        [data-testid="stHeading"] h1,
+        [data-testid="stHeading"] h1 span {
+            margin: 0 !important;
+            padding: 0 !important;
+            line-height: 1.1 !important;
+            position: static !important;
+        }
+        [data-testid="stCaptionContainer"] {
+            margin: -0.35rem 0 0.25rem 0 !important;
+        }
+        """
+
     st.markdown(
         "<style>" + bg_css + static_css + "</style>",
         unsafe_allow_html=True,
@@ -278,7 +304,7 @@ def request(method: str, path: str, token: str, **kwargs):
 
 
 st.set_page_config(page_title="OnCall-HR-ADMO", page_icon="⌬", layout="wide")
-_inject_custom_theme()
+_inject_custom_theme(compact_layout=bool(st.session_state.get("chat_history")))
 
 _logo_file = _ASSETS / "text_logo2.png"
 if _logo_file.is_file():
@@ -315,7 +341,7 @@ with chat_tab:
 
     # Render pesan riwayat hanya jika sudah ada riwayat obrolan
     if history:
-        chat_container = chat_placeholder.container(height=280)
+        chat_container = chat_placeholder.container(height=560)
         with chat_container:
             for entry in history:
                 with st.chat_message(entry["role"]):
@@ -355,7 +381,7 @@ with chat_tab:
 
         # Jika container belum dibuat (giliran pertama), inisialisasi di dalam placeholder
         if chat_container is None:
-            chat_container = chat_placeholder.container(height=480)
+            chat_container = chat_placeholder.container(height=560)
 
         # Pesan baru pengguna dan asisten dirender KE DALAM chat_container, di atas input
         with chat_container:
