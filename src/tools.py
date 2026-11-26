@@ -22,7 +22,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "search_hr_policy",
         "description": "Cari dokumen kebijakan HR resmi dengan pencarian hibrida.",
-        "strict": True,
         "parameters": {
             "type": "object",
             "properties": {
@@ -42,7 +41,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "get_my_leave_balance",
         "description": "Ambil saldo cuti resmi milik pegawai yang sedang login. Tidak menerima parameter identitas.",
-        "strict": True,
         "parameters": {
             "type": "object",
             "properties": {},
@@ -53,7 +51,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "prepare_leave_request",
         "description": "Siapkan draft proposal pengajuan cuti baru yang harus dikonfirmasi manual oleh pegawai.",
-        "strict": True,
         "parameters": {
             "type": "object",
             "properties": {
@@ -82,7 +79,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "create_hr_ticket",
         "description": "Buat tiket eskalasi kasus atau pengecualian ke tim HR.",
-        "strict": True,
         "parameters": {
             "type": "object",
             "properties": {

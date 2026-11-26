@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS policy_chunk (
     version TEXT NOT NULL,
     effective_date DATE NOT NULL,
     content TEXT NOT NULL,
-    embedding VECTOR(1536), -- Dimensi default 1536 (OpenAI text-embedding-3-small)
+    embedding VECTOR(768),
     search_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (document_id, section, version)
